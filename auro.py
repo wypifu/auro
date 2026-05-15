@@ -17,8 +17,8 @@ import argparse
 import requests
 import subprocess
 import re
-import os
 from pathlib import Path
+from urllib.parse import quote
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -26,15 +26,23 @@ CONFIG_PATH = Path.home() / ".config" / "auro" / "config.toml"
 AUR_RPC     = "https://aur.archlinux.org/rpc/v5"
 AUR_GIT     = "https://aur.archlinux.org/{}.git"
 
+VERIFY_NONE     = "none"
+VERIFY_QUICK    = "quick"
+VERIFY_NORMAL   = "normal"
+VERIFY_PARANOID = "paranoid"
+
 # ─── Colors ───────────────────────────────────────────────────────────────────
 
-R     = "\033[0m"
-BOLD  = "\033[1m"
-GREEN = "\033[32m"
-CYAN  = "\033[36m"
-YELLW = "\033[33m"
-RED   = "\033[31m"
-GRAY  = "\033[90m"
+if sys.stdout.isatty():
+    R     = "\033[0m"
+    BOLD  = "\033[1m"
+    GREEN = "\033[32m"
+    CYAN  = "\033[36m"
+    YELLW = "\033[33m"
+    RED   = "\033[31m"
+    GRAY  = "\033[90m"
+else:
+    R = BOLD = GREEN = CYAN = YELLW = RED = GRAY = ""
 
 def info(msg):  print(f"{BOLD}[auro]{R} {msg}")
 def ok(msg):    print(f"{BOLD}[auro]{R} {GREEN}{msg}{R}")
@@ -47,8 +55,15 @@ def err(msg):   print(f"{BOLD}[auro]{R} {RED}{msg}{R}")
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
         create_default_config()
-    with open(CONFIG_PATH, "rb") as f:
-        return tomllib.load(f)
+    try:
+        with open(CONFIG_PATH, "rb") as f:
+            return tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        err(f"Invalid config file ({CONFIG_PATH}): {e}")
+        sys.exit(1)
+    except OSError as e:
+        err(f"Cannot read config ({CONFIG_PATH}): {e}")
+        sys.exit(1)
 
 
 def create_default_config():
@@ -56,7 +71,7 @@ def create_default_config():
     default = {
         "auro": {
             "aur_dir": str(Path.home() / "Builds" / "AUR"),
-            "verify_level": "normal"  # none | quick | normal | paranoid
+            "verify_level": VERIFY_NORMAL
         }
     }
     with open(CONFIG_PATH, "wb") as f:
@@ -74,21 +89,19 @@ def get_aur_dir(config: dict) -> Path:
 
 
 def get_verify_level(config: dict, cli_no_verify: bool = False, cli_verify_level: str = None) -> str:
-    """Determine verification level from config and CLI flags."""
     if cli_no_verify:
-        return "none"
+        return VERIFY_NONE
     if cli_verify_level:
         return cli_verify_level
-    return config.get("auro", {}).get("verify_level", "normal")
+    return config.get("auro", {}).get("verify_level", VERIFY_NORMAL)
 
 
 def get_verify_level_display(level: str) -> str:
-    """Return a colored display string for verify level."""
     colors = {
-        "none": f"{RED}none{R} (⚠️  no verification)",
-        "quick": f"{YELLW}quick{R} (warnings only)",
-        "normal": f"{GREEN}normal{R} (PKGBUILD review)",
-        "paranoid": f"{CYAN}paranoid{R} (full verification)"
+        VERIFY_NONE:     f"{RED}none{R} (⚠️  no verification)",
+        VERIFY_QUICK:    f"{YELLW}quick{R} (warnings only)",
+        VERIFY_NORMAL:   f"{GREEN}normal{R} (PKGBUILD review)",
+        VERIFY_PARANOID: f"{CYAN}paranoid{R} (full verification)"
     }
     return colors.get(level, level)
 
@@ -130,15 +143,21 @@ def installed_version(package: str) -> str | None:
     return None
 
 
+def is_newer_version(aur_ver: str, local_ver: str) -> bool:
+    """Return True if aur_ver > local_ver using pacman's vercmp."""
+    result = subprocess.run(["vercmp", aur_ver, local_ver], capture_output=True, text=True)
+    try:
+        return int(result.stdout.strip()) > 0
+    except (ValueError, AttributeError):
+        return aur_ver != local_ver
+
+
 def is_base_devel_installed() -> tuple[bool, list[str]]:
     """Check if makepkg dependencies are available. Returns (is_installed, [missing_packages])."""
-
-    # First, try to run makepkg --version to see if it works
     result = subprocess.run(["makepkg", "--version"], capture_output=True)
     if result.returncode == 0:
-        return True, []  # makepkg works, we're good
+        return True, []
 
-    # If not, identify what's missing
     essential = {'gcc', 'make', 'autoconf', 'automake', 'patch', 'binutils', 'pkgconf'}
     missing = []
     for pkg in essential:
@@ -159,7 +178,6 @@ def ensure_base_devel(noconfirm: bool = False) -> bool:
     if base_devel_ok:
         return True
 
-    # Not installed - show warning and propose installation
     warn("base-devel is not fully installed. makepkg will fail without it.")
     if missing:
         print(f"  {GRAY}Missing essential packages: {', '.join(missing)}{R}")
@@ -194,7 +212,8 @@ def ensure_base_devel(noconfirm: bool = False) -> bool:
 
 def auto_verify(pkg_dir: Path) -> tuple[bool, list[str]]:
     """
-    Automatic security checks on PKGBUILD.
+    Heuristic checks on PKGBUILD. Advisory only — obfuscated code bypasses all
+    pattern matching. Always review the PKGBUILD manually.
     Returns (is_safe, list_of_warnings)
     """
     warnings = []
@@ -205,35 +224,27 @@ def auto_verify(pkg_dir: Path) -> tuple[bool, list[str]]:
 
     content = pkgbuild.read_text()
 
-    # Check 1: HTTP vs HTTPS in source
-    http_sources = re.findall(r'source=.*http://', content)
-    if http_sources:
-        warnings.append("⚠️  HTTP source detected (not HTTPS) - integrity risk")
+    if re.search(r'source\s*=.*http://', content):
+        warnings.append("⚠️  HTTP source (not HTTPS) — integrity risk")
 
-    # Check 2: Missing checksums
-    if 'sha256sums' not in content and 'sha512sums' not in content and \
-       'b2sums' not in content and 'md5sums' not in content:
-        warnings.append("⚠️  No checksums (sha256/md5/b2) - file corruption risk")
+    if not any(tag in content for tag in ('sha256sums', 'sha512sums', 'b2sums', 'md5sums')):
+        warnings.append("⚠️  No checksums — file corruption risk")
 
-    # Check 3: Installing files into /home/
-    if re.search(r"['\"]/home/", content):
-        warnings.append("⚠️  Installation into /home/ - potentially suspicious")
+    if re.search(r"['\"/]home/", content):
+        warnings.append("⚠️  References /home/ — potentially suspicious")
 
-    # Check 4: curl | bash pattern
-    if 'curl' in content and '| bash' in content:
-        warnings.append("🔴 DANGER: curl | bash detected - executes unverified code")
+    if re.search(r'\bcurl\b.*\|\s*(ba)?sh\b', content) or \
+       re.search(r'\bwget\b.*-O\s*-.*\|\s*(ba)?sh\b', content):
+        warnings.append("🔴 DANGER: download piped to shell — executes unverified code")
 
-    # Check 5: rm -rf / patterns
-    if 'rm -rf /' in content or 'rm -rf /*' in content:
-        warnings.append("🔴 CRITICAL: rm -rf / detected - system destruction risk")
+    if re.search(r'\brm\s+-rf\s+/(?:[/*\s]|$)', content, re.MULTILINE):
+        warnings.append("🔴 CRITICAL: rm -rf / detected — system destruction risk")
 
-    # Check 6: Dynamic pkgver()
     if 'pkgver()' in content:
-        warnings.append("ℹ️  Dynamic pkgver() - version may change on each build")
+        warnings.append("ℹ️  Dynamic pkgver() — version may change on each build")
 
-    # Check 7: Running commands as root in build()
-    if 'sudo' in content and 'build()' in content:
-        warnings.append("⚠️  sudo command in build() - privilege escalation risk")
+    if re.search(r'\bsudo\b', content):
+        warnings.append("⚠️  sudo in PKGBUILD — privilege escalation risk")
 
     return True, warnings
 
@@ -243,11 +254,10 @@ def interactive_review(pkg_dir: Path, package: str, warnings: list[str], verify_
     Ask user to review package before installation.
     Returns True if user approves installation.
     """
-    if verify_level == "none":
+    if verify_level == VERIFY_NONE:
         return True
 
-    if verify_level == "quick":
-        # Only show warnings, no PKGBUILD review
+    if verify_level == VERIFY_QUICK:
         if warnings:
             print(f"\n{BOLD}{YELLW}Warnings for {package}:{R}")
             for w in warnings:
@@ -260,14 +270,12 @@ def interactive_review(pkg_dir: Path, package: str, warnings: list[str], verify_
     # Normal or paranoid mode
     print(f"\n{BOLD}{CYAN}━━━ Package Review: {package} ━━━{R}\n")
 
-    # Show auto-warnings
     if warnings:
-        print(f"{BOLD}{YELLW}Automatic warnings:{R}")
+        print(f"{BOLD}{YELLW}Heuristic warnings (advisory — manual review is the only real check):{R}")
         for w in warnings:
             print(f"  {w}")
         print()
 
-    # Main review menu
     while True:
         print(f"{BOLD}What would you like to do?{R}")
         print(f"  {GREEN}[1]{R} View PKGBUILD (recommended)")
@@ -280,7 +288,7 @@ def interactive_review(pkg_dir: Path, package: str, warnings: list[str], verify_
         if srcinfo.exists():
             print(f"  {GREEN}[3]{R} View .SRCINFO")
 
-        if verify_level == "paranoid":
+        if verify_level == VERIFY_PARANOID:
             print(f"  {GREEN}[4]{R} Verify source files (makepkg --verifysource)")
 
         print(f"  {GREEN}[c]{R} Continue installation without viewing")
@@ -290,18 +298,16 @@ def interactive_review(pkg_dir: Path, package: str, warnings: list[str], verify_
 
         if choice == "1":
             subprocess.run(["less", str(pkg_dir / "PKGBUILD")])
-            # After viewing, ask for final confirmation
             confirm = input(f"\n{BOLD}Install {package} after review?{R} [y/N]: ")
             return confirm.lower() in ('y', 'yes')
 
         elif choice == "2" and install_file.exists():
             subprocess.run(["less", str(install_file)])
-            # Loop back to menu
 
         elif choice == "3" and srcinfo.exists():
             subprocess.run(["less", str(srcinfo)])
 
-        elif choice == "4" and verify_level == "paranoid":
+        elif choice == "4" and verify_level == VERIFY_PARANOID:
             info("Verifying source files...")
             subprocess.run(["makepkg", "--verifysource"], cwd=pkg_dir)
             confirm = input(f"\n{BOLD}Source verification complete. Install?{R} [y/N]: ")
@@ -319,27 +325,33 @@ def interactive_review(pkg_dir: Path, package: str, warnings: list[str], verify_
             warn(f"Invalid choice: {choice}")
 
 
-def review_update(pkg_dir: Path, package: str, old_version: str, new_version: str) -> bool:
-    """For updates, show diff if possible and ask for confirmation."""
+def review_update(pkg_dir: Path, package: str, old_version: str, new_version: str,
+                  warnings: list[str], verify_level: str) -> bool:
+    """For updates, show diff and warnings, then ask for confirmation."""
+    if verify_level == VERIFY_NONE:
+        return True
+
     print(f"\n{BOLD}{CYAN}━━━ Update: {package} ━━━{R}")
     print(f"  {YELLW}{old_version}{R} → {GREEN}{new_version}{R}\n")
 
-    # Try to show diff of PKGBUILD
-    old_pkgbuild = pkg_dir / "PKGBUILD"
     backup = pkg_dir / "PKGBUILD.old"
-
     if backup.exists():
         print(f"{BOLD}Changes in PKGBUILD:{R}")
-        result = subprocess.run(["diff", "-u", str(backup), str(old_pkgbuild)],
+        result = subprocess.run(["diff", "-u", str(backup), str(pkg_dir / "PKGBUILD")],
                                 capture_output=True, text=True)
         if result.stdout:
-            # Use less for paging if output is long
             if result.stdout.count('\n') > 20:
                 subprocess.run(["less"], input=result.stdout, text=True)
             else:
                 print(result.stdout)
         else:
             info("No changes in PKGBUILD")
+        print()
+
+    if warnings:
+        print(f"{BOLD}{YELLW}Heuristic warnings (advisory — manual review is the only real check):{R}")
+        for w in warnings:
+            print(f"  {w}")
         print()
 
     confirm = input(f"{BOLD}Apply this update?{R} [y/N]: ")
@@ -383,64 +395,71 @@ def resolve_aur_deps(package: str, visited: set = None) -> list[str]:
     return ordered
 
 
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _rmtree(path: Path) -> bool:
+    try:
+        shutil.rmtree(path)
+        return True
+    except OSError as e:
+        err(f"Failed to delete {path}: {e}")
+        return False
+
+
 # ─── Install ──────────────────────────────────────────────────────────────────
 
 def clone_and_build(package: str, aur_dir: Path, noconfirm: bool = False,
-                    verify_level: str = "normal", is_update: bool = False,
+                    verify_level: str = VERIFY_NORMAL, is_update: bool = False,
                     old_version: str = None) -> bool:
     """
     Clone (or update) and build a package.
     Returns True on success.
     """
     pkg_dir = aur_dir / package
-    backup_pkgbuild = pkg_dir / "PKGBUILD.old" if is_update else None
+    backup_pkgbuild = (pkg_dir / "PKGBUILD.old") if is_update else None
 
-    # Backup old PKGBUILD before updating
+    # Backup old PKGBUILD before pulling
     if is_update and backup_pkgbuild and (pkg_dir / "PKGBUILD").exists():
         shutil.copy(pkg_dir / "PKGBUILD", backup_pkgbuild)
 
     # Clone or pull
-    if pkg_dir.exists():
-        info(f"Updating existing clone: {CYAN}{pkg_dir}{R}")
-        result = subprocess.run(["git", "pull"], cwd=pkg_dir)
-        if result.returncode != 0:
-            err(f"git pull failed for '{package}'")
-            return False
-    else:
-        url = AUR_GIT.format(package)
-        info(f"Cloning {CYAN}{url}{R} → {pkg_dir}")
-        result = subprocess.run(["git", "clone", url, str(pkg_dir)])
-        if result.returncode != 0:
-            err(f"git clone failed for '{package}'")
-            return False
+    is_existing = pkg_dir.exists()
+    try:
+        if is_existing:
+            info(f"Updating existing clone: {CYAN}{pkg_dir}{R}")
+            result = subprocess.run(["git", "pull"], cwd=pkg_dir, timeout=120)
+        else:
+            url = AUR_GIT.format(package)
+            info(f"Cloning {CYAN}{url}{R} → {pkg_dir}")
+            result = subprocess.run(["git", "clone", url, str(pkg_dir)], timeout=300)
+    except subprocess.TimeoutExpired:
+        err(f"git operation timed out for '{package}'")
+        return False
 
-    # For updates, show diff and ask for confirmation
-    if is_update and not noconfirm and old_version:
-        new_version = aur_info(package).get("Version", "?") if aur_info(package) else "?"
-        if not review_update(pkg_dir, package, old_version, new_version):
-            warn(f"Update of {package} cancelled by user")
-            return False
+    if result.returncode != 0:
+        err(f"git {'pull' if is_existing else 'clone'} failed for '{package}'")
+        return False
 
-    # Automatic security checks
+    # Heuristic security checks (always run)
     valid, warnings = auto_verify(pkg_dir)
     if not valid:
         err(f"Security check failed for '{package}'")
         return False
 
-    # Interactive review (unless noconfirm or quick mode with no warnings)
+    # One confirmation pass: review_update for updates, interactive_review for fresh installs
     if not noconfirm:
-        if verify_level == "quick" and not warnings:
-            # Quick mode with no warnings: proceed silently
-            pass
-        elif not interactive_review(pkg_dir, package, warnings, verify_level):
-            warn(f"Installation of {package} cancelled by user")
-            return False
+        if is_update and old_version:
+            pkg_info = aur_info(package)
+            new_version = pkg_info.get("Version", "?") if pkg_info else "?"
+            if not review_update(pkg_dir, package, old_version, new_version, warnings, verify_level):
+                warn(f"Update of {package} cancelled by user")
+                return False
+        elif not (verify_level == VERIFY_QUICK and not warnings):
+            if not interactive_review(pkg_dir, package, warnings, verify_level):
+                warn(f"Installation of {package} cancelled by user")
+                return False
 
-    # Clean up backup file
-    if backup_pkgbuild and backup_pkgbuild.exists():
-        backup_pkgbuild.unlink()
-
-    # Build the package - simple execution, all output goes directly to terminal
+    # Build
     info(f"Building {CYAN}{package}{R}...")
     cmd = ["makepkg", "-si"]
     if noconfirm:
@@ -452,29 +471,29 @@ def clone_and_build(package: str, aur_dir: Path, noconfirm: bool = False,
         err(f"makepkg failed for '{package}'")
         return False
 
+    # Clean up backup only after successful build
+    if backup_pkgbuild and backup_pkgbuild.exists():
+        backup_pkgbuild.unlink()
+
     return True
 
 
-def cmd_install(package: str, config: dict, noconfirm: bool = False, 
+def cmd_install(package: str, config: dict, noconfirm: bool = False,
                 no_verify: bool = False, cli_verify_level: str = None):
     aur_dir = get_aur_dir(config)
     verify_level = get_verify_level(config, no_verify, cli_verify_level)
 
-    # Display verification level
     info(f"Verification level: {get_verify_level_display(verify_level)}")
 
-    # Check if package is already installed
     if is_installed(package):
         ok(f"'{package}' is already installed. Use -Syu to update.")
         return
 
-    # Check if package is in official repos
     if is_pacman_package(package):
         warn(f"'{package}' is available in the official repos.")
         warn(f"Use: sudo pacman -S {package}")
         sys.exit(0)
 
-    # Check base-devel (only needed for actual installation)
     if not ensure_base_devel(noconfirm):
         err("base-devel is required for building AUR packages.")
         sys.exit(1)
@@ -509,12 +528,11 @@ def cmd_install(package: str, config: dict, noconfirm: bool = False,
 
 # ─── Update ───────────────────────────────────────────────────────────────────
 
-def cmd_update(config: dict, package: str = None, noconfirm: bool = False, 
+def cmd_update(config: dict, package: str = None, noconfirm: bool = False,
                no_verify: bool = False, cli_verify_level: str = None):
     aur_dir = get_aur_dir(config)
     verify_level = get_verify_level(config, no_verify, cli_verify_level)
 
-    # Display verification level
     info(f"Verification level: {get_verify_level_display(verify_level)}")
 
     if package:
@@ -531,7 +549,7 @@ def cmd_update(config: dict, package: str = None, noconfirm: bool = False,
             err(f"'{package}' not found on AUR.")
             sys.exit(1)
         aur_ver = pkg_info.get("Version", "?")
-        if local_ver == aur_ver:
+        if not is_newer_version(aur_ver, local_ver):
             ok(f"'{package}' is already up to date ({local_ver}).")
             return
         info(f"Updating {CYAN}{package}{R}: {YELLW}{local_ver}{R} → {GREEN}{aur_ver}{R}")
@@ -552,7 +570,7 @@ def cmd_update(config: dict, package: str = None, noconfirm: bool = False,
     info(f"Checking {len(packages)} AUR package(s) for updates...\n")
 
     to_update = []
-    updates_info = []  # (pkg, local_ver, aur_ver)
+    updates_info = []
     for pkg in packages:
         if not is_installed(pkg):
             print(f"  {GRAY}{pkg}: not installed (skipping — use -R or -C to clean){R}")
@@ -563,7 +581,7 @@ def cmd_update(config: dict, package: str = None, noconfirm: bool = False,
             print(f"  {GRAY}{pkg}: not found on AUR (skipping){R}")
             continue
         aur_ver = pkg_info.get("Version", "?")
-        if local_ver != aur_ver:
+        if is_newer_version(aur_ver, local_ver):
             print(f"  {CYAN}{pkg}{R}: {YELLW}{local_ver}{R} → {GREEN}{aur_ver}{R}  {BOLD}[UPDATE]{R}")
             to_update.append(pkg)
             updates_info.append((pkg, local_ver, aur_ver))
@@ -584,7 +602,6 @@ def cmd_update(config: dict, package: str = None, noconfirm: bool = False,
     for pkg, local_ver, aur_ver in updates_info:
         if not clone_and_build(pkg, aur_dir, noconfirm, verify_level, is_update=True, old_version=local_ver):
             err(f"Failed to update {pkg}")
-            # Continue with other packages? Ask user
             if not noconfirm:
                 cont = input(f"{BOLD}Continue with remaining updates?{R} [Y/n]: ").strip().lower()
                 if cont not in ("", "y", "yes"):
@@ -596,11 +613,10 @@ def cmd_update(config: dict, package: str = None, noconfirm: bool = False,
 # ─── Search ───────────────────────────────────────────────────────────────────
 
 def cmd_search(query: str):
-    # Handle multi-word queries properly
     search_query = " ".join(query) if isinstance(query, list) else query
 
     try:
-        r = requests.get(f"{AUR_RPC}/search/{search_query}", timeout=10)
+        r = requests.get(f"{AUR_RPC}/search/{quote(search_query)}", timeout=10)
         r.raise_for_status()
         data = r.json()
     except requests.RequestException as e:
@@ -641,17 +657,19 @@ def cmd_remove(package: str, config: dict, noconfirm: bool = False):
         err(f"Failed to remove {package}")
         sys.exit(1)
 
+    ok(f"'{package}' removed successfully.")
+
     aur_dir = get_aur_dir(config)
     pkg_dir = aur_dir / package
     if pkg_dir.exists():
         if noconfirm:
-            shutil.rmtree(pkg_dir)
-            ok(f"Source directory deleted.")
+            if _rmtree(pkg_dir):
+                ok("Source directory deleted.")
         else:
             confirm = input(f"{BOLD}Delete source directory{R} {CYAN}{pkg_dir}{R}? [Y/n] ").strip().lower()
             if confirm in ("", "y", "yes"):
-                shutil.rmtree(pkg_dir)
-                ok(f"Source directory deleted.")
+                if _rmtree(pkg_dir):
+                    ok("Source directory deleted.")
             else:
                 warn(f"Source kept. Run 'auro -C' to clean orphaned sources later.")
 
@@ -682,17 +700,21 @@ def cmd_clean(config: dict, noconfirm: bool = False):
 
     print()
     if noconfirm:
+        deleted = 0
         for d in orphans:
-            shutil.rmtree(d)
-            info(f"Deleted {CYAN}{d.name}{R}")
-        ok(f"{len(orphans)} orphaned director(ies) cleaned.")
+            if _rmtree(d):
+                info(f"Deleted {CYAN}{d.name}{R}")
+                deleted += 1
+        ok(f"{deleted} orphaned director(ies) cleaned.")
     else:
         confirm = input(f"{BOLD}Delete all?{R} [Y/n] ").strip().lower()
         if confirm in ("", "y", "yes"):
+            deleted = 0
             for d in orphans:
-                shutil.rmtree(d)
-                info(f"Deleted {CYAN}{d.name}{R}")
-            ok(f"{len(orphans)} orphaned director(ies) cleaned.")
+                if _rmtree(d):
+                    info(f"Deleted {CYAN}{d.name}{R}")
+                    deleted += 1
+            ok(f"{deleted} orphaned director(ies) cleaned.")
         else:
             warn("Aborted.")
 
@@ -741,12 +763,11 @@ def main():
     group.add_argument("-C",   action="store_true",          help="Clean orphaned source directories")
     group.add_argument("-Q",   action="store_true",          help="List all AUR packages managed by auro")
 
-    # Security/automation flags
     parser.add_argument("--noconfirm", action="store_true",
                        help="Skip all confirmations (dangerous - for scripts)")
     parser.add_argument("--no-verify", action="store_true",
                        help="Skip PKGBUILD verification (not recommended)")
-    parser.add_argument("--verify-level", choices=["none", "quick", "normal", "paranoid"],
+    parser.add_argument("--verify-level", choices=[VERIFY_NONE, VERIFY_QUICK, VERIFY_NORMAL, VERIFY_PARANOID],
                        help="Override config verification level")
 
     args = parser.parse_args()
